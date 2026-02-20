@@ -12,6 +12,20 @@ final class ProcessOrchestrator
 	public function __construct(private Connection $db, private MessageBusInterface $bus)
 	{
 	}
+
+	/**
+	 * ВАЖНО:
+	 * source_job_id хранится в process_instance
+	 * и автоматически подтягивается при dispatch step.
+	 */
+	private function dispatchStep(int $processId, string $stepName): void
+	{
+		$sourceJobId = $this->db->fetchOne('SELECT source_job_id FROM process_instance WHERE id = ?', [
+				$processId
+		]);
+
+		$this->bus->dispatch(new RunProcessStepMessage($processId, $stepName, [], $sourceJobId ? ( int ) $sourceJobId : null));
+	}
 	public function startProcess(string $processType, ?string $businessKey, array $payload, ?int $sourceJobId = null): int
 	{
 		$this->db->beginTransaction();
@@ -54,7 +68,8 @@ final class ProcessOrchestrator
 
 		$this->db->commit();
 
-		$this->bus->dispatch(new RunProcessStepMessage($processId, 'prepare'));
+		//$this->bus->dispatch(new RunProcessStepMessage($processId, 'prepare'));
+		$this->dispatchStep($processId, 'prepare');
 
 		return $processId;
 	}
@@ -98,39 +113,42 @@ final class ProcessOrchestrator
 		$this->db->commit();
 	}
 
-	
 	/* Патч 1: fanOut — диспатчить только реально созданные шаги
 	 * Эффект:
-     * retry dispatch не создаёт дубликатов сообщений
-     * fanOut становится exactly-once по диспатчу
+	 * retry dispatch не создаёт дубликатов сообщений
+	 * fanOut становится exactly-once по диспатчу
 	 */
-	
 	public function fanOut(int $processId, string $joinGroup, array $steps): void
 	{
 		$this->db->beginTransaction();
-		
+
 		$created = [];
-		
-		foreach ($steps as $stepName) {
-			$affected = $this->db->executeStatement(
-					'INSERT INTO process_step (process_instance_id, step_name, status, join_group)
+
+		foreach ( $steps as $stepName )
+		{
+			$affected = $this->db->executeStatement('INSERT INTO process_step (process_instance_id, step_name, status, join_group)
              VALUES (?, ?, ?, ?)
-             ON CONFLICT (process_instance_id, step_name) DO NOTHING',
-					[$processId, $stepName, 'PENDING', $joinGroup]
-					);
-			
-			if ($affected === 1) {
+             ON CONFLICT (process_instance_id, step_name) DO NOTHING', [
+					$processId,
+					$stepName,
+					'PENDING',
+					$joinGroup
+			]);
+
+			if ($affected === 1)
+			{
 				$created[] = $stepName; // ← только новые шаги диспатчим
 			}
 		}
-		
+
 		$this->db->commit();
-		
-		foreach ($created as $stepName) {
-			$this->bus->dispatch(new RunProcessStepMessage($processId, $stepName));
+
+		foreach ( $created as $stepName )
+		{
+			//$this->bus->dispatch(new RunProcessStepMessage($processId, $stepName));
+			$this->dispatchStep($processId, $stepName);
 		}
 	}
-	
 	public function tryJoin(int $processId, string $joinGroup, string $nextStep): void
 	{
 		$this->db->beginTransaction();
@@ -178,7 +196,8 @@ final class ProcessOrchestrator
 
 		if ($shouldDispatch)
 		{
-			$this->bus->dispatch(new RunProcessStepMessage($processId, $nextStep));
+			//$this->bus->dispatch(new RunProcessStepMessage($processId, $nextStep));
+			$this->dispatchStep($processId, $nextStep);
 		}
 	}
 	public function markStepFailed(int $processId, string $stepName, string $error): void
@@ -247,25 +266,26 @@ final class ProcessOrchestrator
 
 		if ($shouldDispatch)
 		{
-			$this->bus->dispatch(new RunProcessStepMessage($processId, 'dispatch'));
+			//$this->bus->dispatch(new RunProcessStepMessage($processId, 'dispatch'));
+			$this->dispatchStep($processId, 'dispatch');
 		}
 	}
 	public function createStep(int $processId, string $stepName, ?string $joinGroup = null): void
 	{
-		
+
 		// Проверяем, существует ли уже такой шаг
 		$exists = $this->db->fetchOne('SELECT id FROM process_step
          WHERE process_instance_id = ?
          AND step_name = ?', [
-         		$processId,
-         		$stepName
-         ]);
-		
+				$processId,
+				$stepName
+		]);
+
 		if ($exists)
 		{
 			return; // идемпотентность
 		}
-		
+
 		// Создаём шаг
 		$this->db->insert('process_step', [
 				'process_instance_id' => $processId,
@@ -275,9 +295,10 @@ final class ProcessOrchestrator
 				'join_group' => $joinGroup,
 				'created_at' => (new \DateTime())->format('Y-m-d H:i:s')
 		]);
-		
+
 		// Отправляем в очередь
-		$this->bus->dispatch(new \App\Message\RunProcessStepMessage($processId, $stepName));
+		//$this->bus->dispatch(new \App\Message\RunProcessStepMessage($processId, $stepName));
+		$this->dispatchStep($processId, $stepName);
 	}
 }
 
