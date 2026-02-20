@@ -7,7 +7,7 @@ use Symfony\Component\Messenger\MessageBusInterface;
 use App\Message\RunProcessStepMessage;
 use Doctrine\DBAL\Exception\UniqueConstraintViolationException;
 
-final class ProcessOrchestrator
+final class ProcessOrchestrator_
 {
 	public function __construct(private Connection $db, private MessageBusInterface $bus)
 	{
@@ -58,12 +58,24 @@ final class ProcessOrchestrator
 			}
 		}
 
-		$this->db->executeStatement('INSERT INTO process_step (process_instance_id, step_name, status)
-             VALUES (?, ?, ?)
+		/*
+		 $this->db->executeStatement('INSERT INTO process_step (process_instance_id, step_name, status)
+		 VALUES (?, ?, ?)
+		 ON CONFLICT (process_instance_id, step_name) DO NOTHING', [
+		 $processId,
+		 'prepare',
+		 'PENDING'
+		 ]);
+		 */
+		// prepare step получает payload процесса как input
+		$this->db->executeStatement('INSERT INTO process_step
+             (process_instance_id, step_name, status, input_payload)
+             VALUES (?, ?, ?, ?)
              ON CONFLICT (process_instance_id, step_name) DO NOTHING', [
 				$processId,
 				'prepare',
-				'PENDING'
+				'PENDING',
+				json_encode($payload)
 		]);
 
 		$this->db->commit();
@@ -73,7 +85,7 @@ final class ProcessOrchestrator
 
 		return $processId;
 	}
-	public function markStepDone(int $processId, string $stepName): void
+	public function markStepDone(int $processId, string $stepName, array $outputPayload = []): void
 	{
 		$this->db->beginTransaction();
 
@@ -95,9 +107,10 @@ final class ProcessOrchestrator
 		}
 
 		$this->db->executeStatement('UPDATE process_step
-             SET status = ?, updated_at = NOW(), finished_at = NOW()
+             SET status = ?, output_payload = ?, updated_at = NOW(), finished_at = NOW()
              WHERE id = ? AND status != ?', [
 				'DONE',
+				json_encode($outputPayload),
 				$step['id'],
 				'DONE'
 		]);
@@ -118,7 +131,7 @@ final class ProcessOrchestrator
 	 * retry dispatch не создаёт дубликатов сообщений
 	 * fanOut становится exactly-once по диспатчу
 	 */
-	public function fanOut(int $processId, string $joinGroup, array $steps): void
+	public function fanOut(int $processId, string $joinGroup, array $steps, array $sharedPayload = []): void
 	{
 		$this->db->beginTransaction();
 
@@ -126,13 +139,25 @@ final class ProcessOrchestrator
 
 		foreach ( $steps as $stepName )
 		{
-			$affected = $this->db->executeStatement('INSERT INTO process_step (process_instance_id, step_name, status, join_group)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT (process_instance_id, step_name) DO NOTHING', [
+			/*
+			 $affected = $this->db->executeStatement('INSERT INTO process_step (process_instance_id, step_name, status, join_group)
+			 VALUES (?, ?, ?, ?)
+			 ON CONFLICT (process_instance_id, step_name) DO NOTHING', [
+			 $processId,
+			 $stepName,
+			 'PENDING',
+			 $joinGroup
+			 ]);
+			 */
+			$affected = $this->db->executeStatement('INSERT INTO process_step
+                    (process_instance_id, step_name, status, join_group, input_payload)
+                 VALUES (?, ?, ?, ?, ?::jsonb)
+                 ON CONFLICT (process_instance_id, step_name) DO NOTHING', [
 					$processId,
 					$stepName,
 					'PENDING',
-					$joinGroup
+					$joinGroup,
+					json_encode($sharedPayload)
 			]);
 
 			if ($affected === 1)
@@ -153,8 +178,19 @@ final class ProcessOrchestrator
 	{
 		$this->db->beginTransaction();
 
-		$rows = $this->db->fetchAllAssociative('SELECT id, status FROM process_step
-             WHERE process_instance_id = ? AND join_group = ?
+		/*
+		 $rows = $this->db->fetchAllAssociative('SELECT id, status FROM process_step
+		 WHERE process_instance_id = ? AND join_group = ?
+		 FOR UPDATE', [
+		 $processId,
+		 $joinGroup
+		 ]);
+		 */
+
+		$rows = $this->db->fetchAllAssociative('SELECT id, status, output_payload
+             FROM process_step
+             WHERE process_instance_id = ?
+             AND join_group = ?
              FOR UPDATE', [
 				$processId,
 				$joinGroup
@@ -175,6 +211,15 @@ final class ProcessOrchestrator
 			}
 		}
 
+		/* агрегируем output всех шагов */
+		$mergedPayload = [];
+
+		foreach ( $rows as $row )
+		{
+			$payload = json_decode($row['output_payload'], true) ?? [];
+			$mergedPayload = array_merge($mergedPayload, $payload);
+		}
+
 		$exists = $this->db->fetchOne('SELECT 1 FROM process_step WHERE process_instance_id = ? AND step_name = ?', [
 				$processId,
 				$nextStep
@@ -187,7 +232,8 @@ final class ProcessOrchestrator
 			$this->db->insert('process_step', [
 					'process_instance_id' => $processId,
 					'step_name' => $nextStep,
-					'status' => 'PENDING'
+					'status' => 'PENDING',
+					'input_payload' => json_encode($mergedPayload)
 			]);
 			$shouldDispatch = true;
 		}
@@ -270,7 +316,7 @@ final class ProcessOrchestrator
 			$this->dispatchStep($processId, 'dispatch');
 		}
 	}
-	public function createStep(int $processId, string $stepName, ?string $joinGroup = null): void
+	public function createStep(int $processId, string $stepName, array $inputPayload = [], ?string $joinGroup = null): void
 	{
 
 		// Проверяем, существует ли уже такой шаг
@@ -293,6 +339,7 @@ final class ProcessOrchestrator
 				'status' => 'PENDING',
 				'attempt' => 0,
 				'join_group' => $joinGroup,
+				'input_payload' => json_encode($inputPayload),
 				'created_at' => (new \DateTime())->format('Y-m-d H:i:s')
 		]);
 
