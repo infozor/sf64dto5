@@ -7,7 +7,7 @@ use Symfony\Component\Messenger\MessageBusInterface;
 use App\Message\RunProcessStepMessage;
 use Doctrine\DBAL\Exception\UniqueConstraintViolationException;
 
-final class ProcessOrchestrator_
+final class ProcessOrchestrator
 {
 	public function __construct(private Connection $db, private MessageBusInterface $bus)
 	{

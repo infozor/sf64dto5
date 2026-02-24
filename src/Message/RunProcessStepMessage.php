@@ -12,5 +12,6 @@ final class RunProcessStepMessage
 {
 	public function __construct(public int $processId, public string $stepName, public array $input = [], public ?int $sourceJobId = null)
 	{
+		$a = 1;
 	}
 }

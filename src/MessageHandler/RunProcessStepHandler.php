@@ -10,31 +10,17 @@ use Symfony\Component\Messenger\Attribute\AsMessageHandler;
 #[AsMessageHandler]
 final class RunProcessStepHandler
 {
-
-
-	/**
-	 * Выполнение бизнес-шагов.
-	 *
-	 * ВАЖНО:
-	 * - здесь только реальные executable steps
-	 * - orchestration-шаги (fan_out, next) НЕ указываются
-	 * - граф процесса определяется processGraph
-	 */
 	private array $stepExecutors = [
 
-			// root steps
 			'prepare' => 'callPrepare',
 
-			// dispatch fan-out
 			'call_api_a' => 'callApiA',
 			'call_api_b' => 'callApiB',
 			'generate_doc' => 'generateDocument',
 
-			// archive fan-out
 			'archive_db' => 'archiveDb',
 			'archive_files' => 'archiveFiles',
 
-			// final step
 			'finalize' => 'callFinalize'
 	];
 	private array $processGraph = [
@@ -72,11 +58,9 @@ final class RunProcessStepHandler
 
 			'archive_db' => [],
 			'archive_files' => [],
-
 			'call_api_a' => [],
 			'call_api_b' => [],
 			'generate_doc' => [],
-
 			'finalize' => []
 	];
 	public function __construct(private Connection $db, private ProcessOrchestrator $orchestrator, private string $projectDir)
@@ -87,7 +71,8 @@ final class RunProcessStepHandler
 		$this->db->beginTransaction();
 
 		$step = $this->db->fetchAssociative('SELECT * FROM process_step
-             WHERE process_instance_id = ? AND step_name = ?
+             WHERE process_instance_id = ?
+             AND step_name = ?
              FOR UPDATE', [
 				$message->processId,
 				$message->stepName
@@ -99,7 +84,6 @@ final class RunProcessStepHandler
 			return;
 		}
 
-		// DONE / FAILED — идемпотентность
 		if (in_array($step['status'], [
 				'DONE',
 				'FAILED'
@@ -109,14 +93,12 @@ final class RunProcessStepHandler
 			return;
 		}
 
-		// RUNNING retry защита
 		if ($step['status'] === 'RUNNING' && $step['attempt'] > 1)
 		{
 			$this->db->rollBack();
 			return;
 		}
 
-		// Атомарный захват
 		$affected = $this->db->executeStatement('UPDATE process_step
              SET status = ?, attempt = attempt + 1, locked_at = NOW()
              WHERE id = ? AND status = ?', [
@@ -137,32 +119,42 @@ final class RunProcessStepHandler
 		{
 
 			/**
-			 * 1️⃣ Выполняем бизнес-шаг
+			 * ==============================
+			 * 1️⃣ Load INPUT payload
+			 * ==============================
 			 */
-			$this->executeBusinessStep($message->processId, $message->stepName);
+			$input = json_decode($step['input_payload'] ?? '{}', true) ?? [];
 
 			/**
-			 * 2️⃣ Помечаем DONE
+			 * ==============================
+			 * 2️⃣ Execute business logic
+			 * ==============================
 			 */
-			$this->orchestrator->markStepDone($message->processId, $message->stepName);
+			$output = $this->executeBusinessStep($message->processId, $message->stepName, $input);
+
 
 			/**
-			 * 3️⃣ Обрабатываем переходы (вместо хардкода)
+			 * ==============================
+			 * 4️⃣ DONE
+			 * ==============================
+			 */
+			$this->orchestrator->markStepDone($message->processId, $message->stepName, $output);
+
+			/**
+			 * ==============================
+			 * 5️⃣ transitions
+			 * ==============================
 			 */
 			$this->handleTransitions($message->processId, $message->stepName);
 
 			/**
-			 * 4️⃣ Join (как и раньше)
+			 * ==============================
+			 * 6️⃣ join
+			 * ==============================
 			 */
-			/*
-			 if (!empty($step['join_group']))
-			 {
-			 $this->orchestrator->tryJoin($message->processId, $step['join_group'], 'finalize');
-			 }
-			 */
-
 			if (!empty($step['join_group']))
 			{
+
 				$nextStep = $this->resolveJoinTarget($step['join_group']);
 
 				if ($nextStep !== null)
@@ -179,25 +171,31 @@ final class RunProcessStepHandler
 			throw $e;
 		}
 	}
-	
-	private function executeBusinessStep(int $processId, string $stepName): void
+
+	/**
+	 * ==============================
+	 * BUSINESS EXECUTION
+	 * ==============================
+	 */
+	private function executeBusinessStep(int $processId, string $stepName, array $input): ?array
 	{
-		/**
-		 * Если бизнес-исполнителя нет —
-		 * это orchestration step (fan-out / next / join node).
-		 * Просто ничего не выполняем.
-		 */
 		if (!isset($this->stepExecutors[$stepName]))
 		{
-			return;
+			//return null; // orchestration node
+			return [];
 		}
 
 		$method = $this->stepExecutors[$stepName];
 
-		$this->$method($processId);
+		return $this->$method($processId, $input);
 	}
-	
-	private function handleTransitions(int $processId, string $stepName): void
+
+	/**
+	 * ==============================
+	 * TRANSITIONS (без изменений)
+	 * ==============================
+	 */
+	private function handleTransitions(int $processId, string $stepName, array $outputPayload = []): void
 	{
 		$node = $this->processGraph[$stepName] ?? null;
 
@@ -206,35 +204,20 @@ final class RunProcessStepHandler
 			return;
 		}
 
-		/**
-		 * NEXT transition
-		 */
 		if (isset($node['next']))
 		{
-
-			$this->orchestrator->createStep($processId, $node['next']);
-
+			$this->orchestrator->createStep($processId, $node['next'], $outputPayload);
 			return;
 		}
 
-		/**
-		 * FAN OUT
-		 */
 		if (isset($node['fan_out']))
 		{
-
 			$fan = $node['fan_out'];
-
-			$this->orchestrator->fanOut($processId, $fan['group'], $fan['steps']);
-
+			$this->orchestrator->fanOut($processId, $fan['group'], $fan['steps'],$outputPayload);
 			return;
 		}
 
-		/**
-		 * JOIN handling
-		 * (если текущий шаг входит в fanout другого узла)
-		 */
-		foreach ( $this->processGraph as $parentStep => $parentNode )
+		foreach ( $this->processGraph as $parentNode )
 		{
 
 			if (!isset($parentNode['fan_out']))
@@ -252,48 +235,80 @@ final class RunProcessStepHandler
 			$this->orchestrator->tryJoin($processId, $fan['group'], $fan['join_to']);
 		}
 	}
-	
 	private function resolveJoinTarget(string $joinGroup): ?string
 	{
-		foreach ( $this->processGraph as $step => $config )
+		foreach ( $this->processGraph as $config )
 		{
+
 			if (!isset($config['fan_out']))
+			{
 				continue;
+			}
 
 			if ($config['fan_out']['group'] === $joinGroup)
+			{
 				return $config['fan_out']['join_to'] ?? null;
+			}
 		}
 
 		return null;
 	}
 
-	// ===== Бизнес =====
-	private function callPrepare(int $processId): void
+	// ================= BUSINESS =================
+	private function callPrepare(int $processId, array $input): array
 	{
 		sleep(1);
+
+		return [
+				'preparedAt' => date('c')
+		];
 	}
-	private function callApiA(int $processId): void
+	private function callApiA(int $processId, array $input): array
 	{
 		sleep(1);
+
+		return [
+				'apiA' => 'ok'
+		];
 	}
-	private function callApiB(int $processId): void
+	private function callApiB(int $processId, array $input): array
 	{
 		sleep(1);
+
+		return [
+				'apiB' => 'ok'
+		];
 	}
-	private function generateDocument(int $processId): void
+	private function generateDocument(int $processId, array $input): array
 	{
 		sleep(1);
+
+		return [
+				'documentId' => rand(1000, 9999)
+		];
 	}
-	private function callFinalize(int $processId): void
+	private function archiveDb(int $processId, array $input): array
 	{
 		sleep(1);
+
+		return [
+				'dbArchived' => true
+		];
 	}
-	private function archiveDb(int $processId): void
+	private function archiveFiles(int $processId, array $input): array
 	{
 		sleep(1);
+
+		return [
+				'filesArchived' => true
+		];
 	}
-	private function archiveFiles(int $processId): void
+	private function callFinalize(int $processId, array $input): array
 	{
 		sleep(1);
+
+		return [
+				'finalized' => true
+		];
 	}
 }
