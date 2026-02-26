@@ -21,13 +21,17 @@ final class DebugProcessStepCommand extends Command
 	}
 	protected function configure(): void
 	{
-		$this->addArgument('processId', InputArgument::REQUIRED)->addArgument('stepName', InputArgument::REQUIRED)->addOption('show-payload', null, InputOption::VALUE_NONE, 'Print input/output payload');
+		$this->addArgument('processId', InputArgument::REQUIRED)->addArgument('stepName', InputArgument::REQUIRED)->addArgument('payload', InputArgument::OPTIONAL, 'JSON payload for the step')->addOption('show-payload', null, InputOption::VALUE_NONE, 'Print input/output payload');
 	}
 	protected function execute(InputInterface $input, OutputInterface $output): int
 	{
-		$processId = ( int ) $input->getArgument('processId');
+		$processId = ( int ) $input->getArgument('processId'); 
 		$stepName = ( string ) $input->getArgument('stepName');
 		$showPayload = ( bool ) $input->getOption('show-payload');
+		$payload = ( string ) $input->getArgument('payload');
+		
+		$payload_array = json_decode($payload, true); //входные параметры
+		
 
 		$output->writeln('');
 		$output->writeln("<info>▶ Running process {$processId} step '{$stepName}'</info>");
@@ -54,7 +58,7 @@ final class DebugProcessStepCommand extends Command
 			 * EXECUTE HANDLER (sync)
 			 * =============================== */
 
-			($this->handler)(new RunProcessStepMessage($processId, $stepName));
+			($this->handler)(new RunProcessStepMessage($processId, $stepName, $payload_array));
 
 			$duration = round(microtime(true) - $startedAt, 3);
 
