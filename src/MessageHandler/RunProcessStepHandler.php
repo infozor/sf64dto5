@@ -145,7 +145,7 @@ final class RunProcessStepHandler
 			 * 5️⃣ transitions
 			 * ==============================
 			 */
-			$this->handleTransitions($message->processId, $message->stepName);
+			$this->handleTransitions($message->processId, $message->stepName, $output);
 
 			/**
 			 * ==============================
