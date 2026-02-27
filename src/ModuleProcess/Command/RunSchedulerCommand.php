@@ -28,7 +28,7 @@ final class RunSchedulerCommand extends Command
 		$debug = true;
 		if ($debug)
 		{
-			$value = '1007';
+			$value = '1010';
 			$orderId = ( int ) $value;
 			
 			/*

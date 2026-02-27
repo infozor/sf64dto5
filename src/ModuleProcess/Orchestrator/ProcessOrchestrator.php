@@ -316,7 +316,7 @@ final class ProcessOrchestrator
 			$this->dispatchStep($processId, 'dispatch');
 		}
 	}
-	public function createStep(int $processId, string $stepName, array $inputPayload = [], ?string $joinGroup = null): void
+	public function createStep_old(int $processId, string $stepName, array $inputPayload = [], ?string $joinGroup = null): void
 	{
 
 		// Проверяем, существует ли уже такой шаг
@@ -346,6 +346,35 @@ final class ProcessOrchestrator
 		// Отправляем в очередь
 		//$this->bus->dispatch(new \App\Message\RunProcessStepMessage($processId, $stepName));
 		$this->dispatchStep($processId, $stepName);
+	}
+
+	/*
+	 * Универсальное создание шага.
+	 *
+	 * FIX:
+	 * теперь fully idempotent entrypoint.
+	 */
+	public function createStep(int $processId, string $stepName, array $inputPayload = [], ?string $joinGroup = null): void
+	{
+		$affected = $this->db->executeStatement('INSERT INTO process_step
+             (process_instance_id, step_name, status, attempt, join_group, input_payload, created_at)
+             VALUES (?, ?, ?, 0, ?, ?::jsonb, NOW())
+             ON CONFLICT (process_instance_id, step_name) DO NOTHING', [
+				$processId,
+				$stepName,
+				'PENDING',
+				$joinGroup,
+				json_encode($inputPayload)
+		]);
+
+		/**
+		 * FIX:
+		 * dispatch только если реально создан.
+		 */
+		if ($affected === 1)
+		{
+			$this->dispatchStep($processId, $stepName);
+		}
 	}
 }
 

@@ -6,10 +6,21 @@ use App\Message\RunProcessStepMessage;
 use App\ModuleProcess\Orchestrator\ProcessOrchestrator;
 use Doctrine\DBAL\Connection;
 use Symfony\Component\Messenger\Attribute\AsMessageHandler;
+use App\ModuleProcess\Orchestrator\ProcessContextStore;
+use App\ModuleProcess\Orchestrator\StepContext;
 
 #[AsMessageHandler]
 final class RunProcessStepHandler
 {
+	/**
+	 * ==============================
+	 * BUSINESS EXECUTORS
+	 * ==============================
+	 *
+	 * ✅ Только реальные business-шаги.
+	 * orchestration nodes (dispatch, archive, post_dispatch)
+	 * здесь НЕ должны присутствовать.
+	 */
 	private array $stepExecutors = [
 
 			'prepare' => 'callPrepare',
@@ -23,6 +34,14 @@ final class RunProcessStepHandler
 
 			'finalize' => 'callFinalize'
 	];
+
+	/**
+	 * ==============================
+	 * PROCESS GRAPH
+	 * ==============================
+	 *
+	 * orchestration nodes допустимы без executor.
+	 */
 	private array $processGraph = [
 
 			'prepare' => [
@@ -63,7 +82,7 @@ final class RunProcessStepHandler
 			'generate_doc' => [],
 			'finalize' => []
 	];
-	public function __construct(private Connection $db, private ProcessOrchestrator $orchestrator, private string $projectDir)
+	public function __construct(private Connection $db, private ProcessOrchestrator $orchestrator, private string $projectDir, private ProcessContextStore $contextStore)
 	{
 	}
 	public function __invoke(RunProcessStepMessage $message): void
@@ -84,6 +103,9 @@ final class RunProcessStepHandler
 			return;
 		}
 
+		/**
+		 * ✅ Idempotency guard
+		 */
 		if (in_array($step['status'], [
 				'DONE',
 				'FAILED'
@@ -93,12 +115,18 @@ final class RunProcessStepHandler
 			return;
 		}
 
+		/**
+		 * ✅ Messenger retry protection
+		 */
 		if ($step['status'] === 'RUNNING' && $step['attempt'] > 1)
 		{
 			$this->db->rollBack();
 			return;
 		}
 
+		/**
+		 * ✅ Atomic worker claim
+		 */
 		$affected = $this->db->executeStatement('UPDATE process_step
              SET status = ?, attempt = attempt + 1, locked_at = NOW()
              WHERE id = ? AND status = ?', [
@@ -120,37 +148,40 @@ final class RunProcessStepHandler
 
 			/**
 			 * ==============================
-			 * 1️⃣ Load INPUT payload
+			 * 1️⃣ LOAD INPUT
 			 * ==============================
 			 */
 			$input = json_decode($step['input_payload'] ?? '{}', true) ?? [];
 
 			/**
 			 * ==============================
-			 * 2️⃣ Execute business logic
+			 * 2️⃣ EXECUTE
 			 * ==============================
 			 */
 			$output = $this->executeBusinessStep($message->processId, $message->stepName, $input);
 
-
 			/**
 			 * ==============================
-			 * 4️⃣ DONE
+			 * 3️⃣ DONE
 			 * ==============================
 			 */
 			$this->orchestrator->markStepDone($message->processId, $message->stepName, $output);
 
 			/**
 			 * ==============================
-			 * 5️⃣ transitions
+			 * 4️⃣ TRANSITIONS
 			 * ==============================
 			 */
 			$this->handleTransitions($message->processId, $message->stepName, $output);
 
 			/**
 			 * ==============================
-			 * 6️⃣ join
+			 * 5️⃣ JOIN CHECK
 			 * ==============================
+			 *
+			 * ✅ FIX:
+			 * join target берётся из graph,
+			 * а не хардкодится finalize.
 			 */
 			if (!empty($step['join_group']))
 			{
@@ -176,23 +207,42 @@ final class RunProcessStepHandler
 	 * ==============================
 	 * BUSINESS EXECUTION
 	 * ==============================
+	 *
+	 * ✅ orchestration nodes возвращают []
+	 * (НЕ null — это важно для payload pipeline)
 	 */
-	private function executeBusinessStep(int $processId, string $stepName, array $input): ?array
+	private function executeBusinessStep(int $processId, string $stepName, array $input): array
 	{
 		if (!isset($this->stepExecutors[$stepName]))
 		{
-			//return null; // orchestration node
-			return [];
+			return []; // orchestration node
 		}
 
 		$method = $this->stepExecutors[$stepName];
 
-		return $this->$method($processId, $input);
+		/**
+		 * ✅ FIX:
+		 * StepContext теперь единая точка доступа
+		 * к shared state процесса.
+		 */
+		$contextData = $this->contextStore->load($processId);
+		$ctx = new StepContext($processId, $contextData, $input);
+
+		$output = $this->$method($ctx);
+
+		/**
+		 * ✅ сохраняем обновлённый context
+		 */
+		//$this->contextStore->save($processId, $ctx->all());
+		$this->contextStore->append($processId, $stepName, $output);
+		
+
+		return $output ?? [];
 	}
 
 	/**
 	 * ==============================
-	 * TRANSITIONS (без изменений)
+	 * TRANSITIONS
 	 * ==============================
 	 */
 	private function handleTransitions(int $processId, string $stepName, array $outputPayload = []): void
@@ -204,37 +254,34 @@ final class RunProcessStepHandler
 			return;
 		}
 
+		/**
+		 * linear transition
+		 */
 		if (isset($node['next']))
 		{
 			$this->orchestrator->createStep($processId, $node['next'], $outputPayload);
 			return;
 		}
 
+		/**
+		 * fan-out transition
+		 */
 		if (isset($node['fan_out']))
 		{
+
 			$fan = $node['fan_out'];
-			$this->orchestrator->fanOut($processId, $fan['group'], $fan['steps'],$outputPayload);
+
+			$this->orchestrator->fanOut($processId, $fan['group'], $fan['steps'], $outputPayload);
+
 			return;
 		}
-
-		foreach ( $this->processGraph as $parentNode )
-		{
-
-			if (!isset($parentNode['fan_out']))
-			{
-				continue;
-			}
-
-			$fan = $parentNode['fan_out'];
-
-			if (!in_array($stepName, $fan['steps'], true))
-			{
-				continue;
-			}
-
-			$this->orchestrator->tryJoin($processId, $fan['group'], $fan['join_to']);
-		}
 	}
+
+	/**
+	 * ==============================
+	 * Resolve join target from graph
+	 * ==============================
+	 */
 	private function resolveJoinTarget(string $joinGroup): ?string
 	{
 		foreach ( $this->processGraph as $config )
@@ -255,58 +302,58 @@ final class RunProcessStepHandler
 	}
 
 	// ================= BUSINESS =================
-	private function callPrepare(int $processId, array $input): array
+	private function callPrepare(StepContext $ctx): array
 	{
 		sleep(1);
+
+		$ctx->set('preparedAt', date('c'));
 
 		return [
-				'preparedAt' => date('c')
+				'preparedAt' => $ctx->get('preparedAt')
 		];
 	}
-	private function callApiA(int $processId, array $input): array
+	private function callApiA(StepContext $ctx): array
 	{
 		sleep(1);
-
 		return [
 				'apiA' => 'ok'
 		];
 	}
-	private function callApiB(int $processId, array $input): array
+	private function callApiB(StepContext $ctx): array
 	{
 		sleep(1);
-
 		return [
 				'apiB' => 'ok'
 		];
 	}
-	private function generateDocument(int $processId, array $input): array
+	private function generateDocument(StepContext $ctx): array
 	{
 		sleep(1);
+
+		$docId = rand(1000, 9999);
+		$ctx->set('documentId', $docId);
 
 		return [
-				'documentId' => rand(1000, 9999)
+				'documentId' => $docId
 		];
 	}
-	private function archiveDb(int $processId, array $input): array
+	private function archiveDb(StepContext $ctx): array
 	{
 		sleep(1);
-
 		return [
 				'dbArchived' => true
 		];
 	}
-	private function archiveFiles(int $processId, array $input): array
+	private function archiveFiles(StepContext $ctx): array
 	{
 		sleep(1);
-
 		return [
 				'filesArchived' => true
 		];
 	}
-	private function callFinalize(int $processId, array $input): array
+	private function callFinalize(StepContext $ctx): array
 	{
 		sleep(1);
-
 		return [
 				'finalized' => true
 		];
